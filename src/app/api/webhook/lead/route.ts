@@ -1,0 +1,222 @@
+import { NextRequest, NextResponse } from "next/server";
+import prisma from "@/lib/prisma";
+import { calculateLeadScore } from "@/lib/lead-scoring";
+
+// POST /api/webhook/lead
+// Receives bot output and creates a lead in the CRM, auto-assigned to a client.
+//
+// Expected body:
+// {
+//   "userfullName": "John Doe",
+//   "phonenumber": "+91 99887 11111",
+//   "reason": "Buy",                   <-- "Buy" or "Rent" maps to transactionType
+//   "userpreferredArea": "Bangalore",
+//   "userbudget": "1.5 Cr",
+//   "propertychoice": "2 BHK Apartment", <-- shown as Property Choice in CRM
+//   "clientId": "clxxxxx",             <-- Option A: use client's database ID
+//   "clientEmail": "agent@firm.com"    <-- Option B: use client's email (auto-lookup)
+//   "secret": "YOUR_WEBHOOK_SECRET"    <-- optional security key
+// }
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+
+    // Optional: simple secret key protection
+    const webhookSecret = process.env.WEBHOOK_SECRET;
+    if (webhookSecret && body.secret !== webhookSecret) {
+      return NextResponse.json({ error: "Unauthorized: invalid secret" }, { status: 401 });
+    }
+
+    const {
+      userfullName,
+      phonenumber,
+      reason,
+      userpreferredArea,
+      userbudget,
+      propertychoice,
+      clientId,
+      clientEmail,
+    } = body;
+
+    if (!userfullName) {
+      return NextResponse.json({ error: "userfullName is required" }, { status: 400 });
+    }
+
+    // Resolve the client to assign this lead to
+    let resolvedClientId: string | null = null;
+    let clientWarning: string | null = null;
+
+    if (clientId) {
+      const client = await prisma.user.findUnique({ where: { id: clientId } });
+      if (!client) {
+        // Don't block lead creation — just leave it unassigned and warn
+        clientWarning = `Client not found with id: ${clientId}. Lead created but unassigned.`;
+        console.warn("[webhook/lead]", clientWarning);
+      } else {
+        resolvedClientId = client.id;
+      }
+    } else if (clientEmail) {
+      const client = await prisma.user.findUnique({ where: { email: clientEmail } });
+      if (!client) {
+        // Don't block lead creation — just leave it unassigned and warn
+        clientWarning = `Client not found with email: ${clientEmail}. Lead created but unassigned.`;
+        console.warn("[webhook/lead]", clientWarning);
+      } else {
+        resolvedClientId = client.id;
+      }
+    }
+
+    // Map reason → transactionType
+    // Accepts: "Buy", "Purchase", "buy", "rent", "Rent", etc.
+    function parseTransactionType(reasonStr: string | undefined): "PURCHASE" | "RENT" | null {
+      if (!reasonStr) return null;
+      const lower = reasonStr.toLowerCase();
+      if (lower.includes("buy") || lower.includes("purchase") || lower.includes("own")) return "PURCHASE";
+      if (lower.includes("rent") || lower.includes("lease")) return "RENT";
+      return null;
+    }
+
+    // Parse a single budget token (e.g. "20K" => 20000, "1.5Cr" => 15000000)
+    function parseSingleBudget(token: string): number | null {
+      const s = token.trim().toUpperCase();
+      // Extract only the first contiguous number from this token
+      const match = s.match(/([0-9]+(?:\.[0-9]+)?)/)
+      if (!match) return null;
+      const num = parseFloat(match[1]);
+      if (isNaN(num)) return null;
+      if (s.includes("CR")) return Math.round(num * 10000000);
+      if (s.includes("L")) return Math.round(num * 100000);
+      if (s.includes("K")) return Math.round(num * 1000);
+      return Math.round(num);
+    }
+
+    // Parse budget string — handles both single values and ranges like "20k-30k"
+    function parseBudgetField(budgetStr: string | undefined): {
+      budget: number | null;
+      budgetMin: number | null;
+      budgetMax: number | null;
+    } {
+      if (!budgetStr) return { budget: null, budgetMin: null, budgetMax: null };
+      const s = budgetStr.toString().trim();
+      // Detect a range: contains a dash that separates two numbers (e.g. "20k-30k", "20K - 30K")
+      const rangeParts = s.split(/\s*-\s*/);
+      if (rangeParts.length === 2) {
+        const min = parseSingleBudget(rangeParts[0]);
+        const max = parseSingleBudget(rangeParts[1]);
+        if (min !== null && max !== null) {
+          return { budget: null, budgetMin: min, budgetMax: max };
+        }
+      }
+      // Single value
+      const single = parseSingleBudget(s);
+      return { budget: single, budgetMin: null, budgetMax: null };
+    }
+
+    const { budget: budgetValue, budgetMin, budgetMax } = parseBudgetField(userbudget);
+    const transactionType = parseTransactionType(reason);
+
+    // propertychoice: handle array or string
+    const propertyChoiceStr = Array.isArray(propertychoice)
+      ? propertychoice.join(", ")
+      : propertychoice || null;
+
+    // Build additional notes (property choice + raw budget stored as free text)
+    const additionalNotes = [
+      reason ? `Intent: ${reason}` : null,
+      propertyChoiceStr ? `Property Choice: ${propertyChoiceStr}` : null,
+      userbudget ? `Raw Budget: ${userbudget}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n") || null;
+
+    // Score the lead
+    const scoring = calculateLeadScore({
+      name: userfullName,
+      phone: phonenumber,
+      budget: budgetValue,
+      budgetMin,
+      budgetMax,
+      transactionType,
+      preferredLocality: userpreferredArea,
+      preferredCity: userpreferredArea,
+      additionalNotes,
+    } as any);
+
+    // Generate share token
+    const shareToken = Array.from(crypto.getRandomValues(new Uint8Array(32)))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    // Create the lead
+    const lead = await prisma.lead.create({
+      data: {
+        name: userfullName,
+        phone: phonenumber || null,
+        source: "AI_AGENT",
+        budget: budgetValue,
+        budgetMin: budgetMin ?? undefined,
+        budgetMax: budgetMax ?? undefined,
+        transactionType: transactionType ?? undefined,
+        preferredLocality: userpreferredArea || null,
+        preferredCity: userpreferredArea || null,
+        // NOTE: preferredPropertyType is a Prisma enum (APARTMENT/VILLA/etc.)
+        // Free-text property name from bot is stored in additionalNotes instead
+        additionalNotes,
+        score: scoring.score,
+        classification: scoring.classification,
+        purchaseIntent: scoring.purchaseIntent,
+        buyingTimeline: scoring.buyingTimeline,
+        followUpPriority: scoring.followUpPriority,
+        closingProbability: scoring.closingProbability,
+        scoringInsights: scoring.insights,
+        conversationHistory: JSON.stringify({
+          reason,
+          transactionType,
+          propertychoice: propertyChoiceStr,
+          rawBudget: userbudget,
+        }),
+        shareToken,
+      },
+    });
+
+    // Auto-assign to the resolved client
+    if (resolvedClientId) {
+      await prisma.leadAssignment.create({
+        data: { leadId: lead.id, userId: resolvedClientId },
+      });
+    }
+
+    // Fetch client info for response
+    let assignedClient = null;
+    if (resolvedClientId) {
+      assignedClient = await prisma.user.findUnique({
+        where: { id: resolvedClientId },
+        select: { id: true, name: true, email: true },
+      });
+    }
+
+    return NextResponse.json(
+      {
+        success: true,
+        message: "Lead created successfully",
+        lead: {
+          id: lead.id,
+          name: lead.name,
+          phone: lead.phone,
+          transactionType: lead.transactionType,
+          preferredPropertyType: lead.preferredPropertyType,
+          score: lead.score,
+          classification: lead.classification,
+          status: lead.status,
+        },
+        assignedTo: assignedClient || "Unassigned (no clientId or clientEmail provided)",
+        ...(clientWarning && { warning: clientWarning }),
+      },
+      { status: 201 }
+    );
+  } catch (error) {
+    console.error("Webhook lead error:", error);
+    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+  }
+}
